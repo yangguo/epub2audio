@@ -4,6 +4,9 @@ import os
 import re
 import sys
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import asyncio
 
 from bs4 import BeautifulSoup
 from ebooklib import epub, ITEM_DOCUMENT
@@ -139,6 +142,56 @@ def synthesize_gtts(text: str, out_path: Path, lang: str, tld: str, slow: bool):
     tts.save(str(out_path))
 
 
+async def _edge_synthesize_async(text: str, out_path: Path, voice: str, rate: str, volume: str, pitch: str):
+    try:
+        import edge_tts
+    except Exception as e:
+        raise RuntimeError("edge-tts is not installed. Run: pip install edge-tts") from e
+
+    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, volume=volume, pitch=pitch)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            # Append mode to handle chunked writes
+            with open(out_path, "ab") as f:
+                f.write(chunk["data"])
+
+
+def synthesize_edge(text: str, out_path: Path, voice: str, rate: str, volume: str, pitch: str):
+    # Ensure file does not pre-exist partially
+    if out_path.exists():
+        out_path.unlink()
+    asyncio.run(_edge_synthesize_async(text, out_path, voice, rate, volume, pitch))
+
+
+def synthesize_with_retry(engine: str,
+                          text: str,
+                          out_path: Path,
+                          *,
+                          lang: str = "en",
+                          tld: str = "com",
+                          slow: bool = False,
+                          voice: str = "en-US-JennyNeural",
+                          rate: str = "+0%",
+                          volume: str = "+0%",
+                          pitch: str = "+0Hz",
+                          max_retries: int = 3,
+                          retry_wait: float = 2.0):
+    attempt = 0
+    while True:
+        try:
+            if engine == "edge":
+                synthesize_edge(text, out_path, voice=voice, rate=rate, volume=volume, pitch=pitch)
+            else:
+                synthesize_gtts(text, out_path, lang=lang, tld=tld, slow=slow)
+            return True
+        except Exception as e:
+            attempt += 1
+            if attempt > max_retries:
+                raise e
+            time.sleep(retry_wait * (2 ** (attempt - 1)))
+
+
 def build_playlist(out_dir: Path, entries):
     m3u = out_dir / "playlist.m3u"
     with m3u.open("w", encoding="utf-8") as f:
@@ -147,18 +200,28 @@ def build_playlist(out_dir: Path, entries):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert an EPUB to an MP3 audiobook using free TTS (gTTS)")
+    parser = argparse.ArgumentParser(description="Convert an EPUB to an MP3 audiobook using free TTS (gTTS or edge-tts)")
     parser.add_argument("epub", type=Path, help="Path to the .epub file")
     parser.add_argument("--outdir", type=Path, default=None, help="Output directory (default: <epubname>_audio)")
+    parser.add_argument("--engine", choices=["gtts", "edge"], default="gtts", help="TTS engine to use")
+    # gTTS options
     parser.add_argument("--lang", default="en", help="gTTS language code, e.g., en, en-uk, es, de")
     parser.add_argument("--tld", default="com", help="gTTS top-level-domain for accent (e.g., com, co.uk, com.au, co.in)")
-    parser.add_argument("--slow", action="store_true", help="Speak more slowly")
+    parser.add_argument("--slow", action="store_true", help="gTTS: speak more slowly")
+    # edge-tts options
+    parser.add_argument("--voice", default="en-US-JennyNeural", help="edge-tts voice name, e.g., en-US-JennyNeural")
+    parser.add_argument("--rate", default="+0%", help="edge-tts speech rate, e.g., '+0%', '-10%'")
+    parser.add_argument("--volume", default="+0%", help="edge-tts volume, e.g., '+0%', '-5%'")
+    parser.add_argument("--pitch", default="+0Hz", help="edge-tts pitch, e.g., '+0Hz', '+2Hz', '-2Hz'")
     parser.add_argument("--min-chapter-chars", type=int, default=200, help="Skip chapters shorter than this length")
     parser.add_argument("--split-on", default=None, help="Comma-separated headings to split on, e.g., 'h1,h2,h3'")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of chapters to render")
     parser.add_argument("--start", type=int, default=0, help="Start from chapter index (0-based)")
     parser.add_argument("--album", default=None, help="Album name for ID3 tags (default: EPUB title or filename)")
     parser.add_argument("--artist", default="Unknown", help="Artist/Author for ID3 tags")
+    parser.add_argument("--jobs", type=int, default=1, help="Number of parallel chapters to synthesize")
+    parser.add_argument("--max-retries", type=int, default=3, help="Retries per chapter on network errors")
+    parser.add_argument("--retry-wait", type=float, default=2.0, help="Initial backoff seconds between retries")
 
     args = parser.parse_args()
 
@@ -197,25 +260,57 @@ def main():
     print(f"Found {len(chapters)} chapter(s) to render.")
     written = []
     total = len(chapters)
+
+    # Prepare tasks
+    tasks = []
     for idx, ch in enumerate(chapters, start=1):
         title = ch["title"] or f"Chapter {idx}"
         safe_title = sanitize_filename(title)
         filename = f"{idx:03d} - {safe_title}.mp3"
         out_path = out_dir / filename
-
-        # Skip if already exists
         if out_path.exists():
             print(f"[{idx}/{total}] Exists, skipping: {filename}")
             written.append(out_path)
             continue
+        tasks.append((idx, title, ch["text"], out_path))
 
-        print(f"[{idx}/{total}] Synthesizing: {filename}")
-        try:
-            synthesize_gtts(ch["text"], out_path, lang=args.lang, tld=args.tld, slow=args.slow)
-            write_id3_tags(out_path, title=title, album=album, artist=args.artist, track_number=idx)
-            written.append(out_path)
-        except Exception as e:
-            print(f"Failed chapter '{title}': {e}", file=sys.stderr)
+    def worker(idx: int, title: str, text: str, out_path: Path):
+        print(f"[{idx}/{total}] Synthesizing: {out_path.name}")
+        synthesize_with_retry(
+            args.engine,
+            text,
+            out_path,
+            lang=args.lang,
+            tld=args.tld,
+            slow=args.slow,
+            voice=args.voice,
+            rate=args.rate,
+            volume=args.volume,
+            pitch=args.pitch,
+            max_retries=args.max_retries,
+            retry_wait=args.retry_wait,
+        )
+        write_id3_tags(out_path, title=title, album=album, artist=args.artist, track_number=idx)
+        return out_path
+
+    if args.jobs > 1 and tasks:
+        max_workers = max(1, min(args.jobs, len(tasks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {ex.submit(worker, idx, title, text, path): (idx, path) for idx, title, text, path in tasks}
+            for fut in as_completed(future_map):
+                idx, path = future_map[fut]
+                try:
+                    out_path = fut.result()
+                    written.append(out_path)
+                except Exception as e:
+                    print(f"Failed chapter {idx}: {e}", file=sys.stderr)
+    else:
+        # Serial fallback
+        for idx, title, text, out_path in tasks:
+            try:
+                written.append(worker(idx, title, text, out_path))
+            except Exception as e:
+                print(f"Failed chapter {idx}: {e}", file=sys.stderr)
 
     if written:
         build_playlist(out_dir, written)
